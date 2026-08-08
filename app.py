@@ -39,7 +39,45 @@ KR_NAME_MAP = {
     "한화시스템": "272210.KS",
     "한화엔진": "082740.KS",
     "남광토건": "001260.KS",
+   
 }
+US_KR_ALIAS = {
+    "엔비디아": ("NVDA", "NVIDIA"),
+    "마이크로소프트": ("MSFT", "Microsoft"),
+    "애플": ("AAPL", "Apple"),
+    "아마존": ("AMZN", "Amazon"),
+    "메타": ("META", "Meta Platforms"),
+    "구글": ("GOOGL", "Alphabet"),
+    "알파벳": ("GOOGL", "Alphabet"),
+    "브로드컴": ("AVGO", "Broadcom"),
+    "팔란티어": ("PLTR", "Palantir Technologies"),
+    "테슬라": ("TSLA", "Tesla"),
+    "에이엠디": ("AMD", "Advanced Micro Devices"),
+    "크라우드스트라이크": ("CRWD", "CrowdStrike"),
+    "오라클": ("ORCL", "Oracle"),
+    "로켓랩": ("RKLB", "Rocket Lab USA"),
+    "조비": ("JOBY", "Joby Aviation"),
+    "조비에비에이션": ("JOBY", "Joby Aviation"),
+    "온다스": ("ONDS", "Ondas Holdings"),
+    "우라늄에너지": ("UEC", "Uranium Energy"),
+    "아이온큐": ("IONQ", "IonQ"),
+    "레드캣": ("RCAT", "Red Cat Holdings"),
+    "리게티": ("RGTI", "Rigetti Computing"),
+    "디웨이브": ("QBTS", "D-Wave Quantum"),
+    "퀀텀컴퓨팅": ("QUBT", "Quantum Computing"),
+    "오클로": ("OKLO", "Oklo"),
+    "뉴스케일": ("SMR", "NuScale Power"),
+    "아처": ("ACHR", "Archer Aviation"),
+    "루시드": ("LCID", "Lucid Group"),
+    "리비안": ("RIVN", "Rivian Automotive"),
+    "코인베이스": ("COIN", "Coinbase"),
+    "넷플릭스": ("NFLX", "Netflix"),
+    "인텔": ("INTC", "Intel"),
+    "퀄컴": ("QCOM", "Qualcomm"),
+    "마이크론": ("MU", "Micron Technology"),
+    "슈퍼마이크로": ("SMCI", "Super Micro Computer"),
+}
+
 
 POSITIVE_WORDS = [
     "beat", "beats", "surge", "surges", "record", "growth", "profit", "profits",
@@ -99,54 +137,131 @@ def parse_tickers(raw: str) -> List[str]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_us_stocks(query: str) -> List[dict]:
-    """
-    Yahoo Finance 검색 결과에서 미국 상장 주식 위주로 반환.
-    나스닥(NMS/NCM/NGM)을 우선 정렬합니다.
-    """
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_stocks(query: str) -> List[dict]:
     q = query.strip()
+
     if not q:
         return []
 
+    results = []
+    seen = set()
+
+    q_clean = q.lower().replace(" ", "")
+
+    # 한국 종목 한글 검색
+    for name, symbol in KR_NAME_MAP.items():
+        name_clean = name.lower().replace(" ", "")
+
+        if q_clean in name_clean or name_clean in q_clean:
+            if symbol not in seen:
+                seen.add(symbol)
+
+                results.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "exchange": "KRX",
+                    "nasdaq": False,
+                })
+
+    # 미국 종목 한글 검색
+    for alias, (symbol, english_name) in US_KR_ALIAS.items():
+        alias_clean = alias.lower().replace(" ", "")
+
+        if q_clean in alias_clean or alias_clean in q_clean:
+            if symbol not in seen:
+                seen.add(symbol)
+
+                results.append({
+                    "symbol": symbol,
+                    "name": f"{alias} · {english_name}",
+                    "exchange": "NASDAQ/US",
+                    "nasdaq": True,
+                })
+
+    # Yahoo Finance 검색
     url = (
         "https://query1.finance.yahoo.com/v1/finance/search"
-        f"?q={quote(q)}&quotesCount=20&newsCount=0"
+        f"?q={quote(q)}&quotesCount=30&newsCount=0"
     )
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    req = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
 
     try:
         with urlopen(req, timeout=6) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(
+                response.read().decode("utf-8")
+            )
     except Exception:
-        return []
+        payload = {}
 
-    rows = []
     for item in payload.get("quotes", []):
-        symbol = str(item.get("symbol", "")).upper()
-        quote_type = str(item.get("quoteType", "")).upper()
-        exchange = str(item.get("exchange", "")).upper()
-        name = item.get("shortname") or item.get("longname") or symbol
+        symbol = str(
+            item.get("symbol", "")
+        ).upper()
 
-        if not symbol or quote_type not in {"EQUITY", "ETF"}:
+        quote_type = str(
+            item.get("quoteType", "")
+        ).upper()
+
+        exchange = str(
+            item.get("exchange", "")
+        ).upper()
+
+        name = (
+            item.get("shortname")
+            or item.get("longname")
+            or symbol
+        )
+
+        if not symbol:
             continue
 
-        is_nasdaq = exchange in {"NMS", "NCM", "NGM", "NASDAQ"}
-        is_us = exchange in {
-            "NMS", "NCM", "NGM", "NASDAQ", "NYQ", "ASE", "PCX", "BTS",
+        if quote_type not in {"EQUITY", "ETF"}:
+            continue
+
+        is_nasdaq = exchange in {
+            "NMS",
+            "NCM",
+            "NGM",
+            "NASDAQ",
         }
-        if not is_us:
+
+        is_us = exchange in {
+            "NMS",
+            "NCM",
+            "NGM",
+            "NASDAQ",
+            "NYQ",
+            "ASE",
+            "PCX",
+            "BTS",
+        }
+
+        is_korea = (
+            symbol.endswith(".KS")
+            or symbol.endswith(".KQ")
+        )
+
+        if not (is_us or is_korea):
             continue
 
-        rows.append({
+        if symbol in seen:
+            continue
+
+        seen.add(symbol)
+
+        results.append({
             "symbol": symbol,
             "name": str(name),
             "exchange": exchange,
             "nasdaq": is_nasdaq,
         })
 
-    rows.sort(key=lambda x: (not x["nasdaq"], x["symbol"]))
-    return rows[:10]
-
+    return results[:15]
 
 # =========================
 # 데이터 다운로드
@@ -926,6 +1041,55 @@ def backtest(
 # =========================
 # 표시 / 엑셀
 # =========================
+TICKER_KR_NAME = {
+    "NVDA": "엔비디아",
+    "MSFT": "마이크로소프트",
+    "AAPL": "애플",
+    "AMZN": "아마존",
+    "META": "메타",
+    "GOOGL": "알파벳",
+    "AVGO": "브로드컴",
+    "PLTR": "팔란티어",
+    "AMD": "AMD",
+    "TSLA": "테슬라",
+    "CRWD": "크라우드스트라이크",
+    "ORCL": "오라클",
+
+    "RKLB": "로켓랩",
+    "JOBY": "조비 에비에이션",
+    "ONDS": "온다스 홀딩스",
+    "UEC": "우라늄 에너지",
+    "IONQ": "아이온큐",
+    "RCAT": "레드캣 홀딩스",
+
+    "RGTI": "리게티 컴퓨팅",
+    "QBTS": "디웨이브 퀀텀",
+    "QUBT": "퀀텀 컴퓨팅",
+    "OKLO": "오클로",
+    "SMR": "뉴스케일 파워",
+    "ACHR": "아처 에비에이션",
+
+    "005930.KS": "삼성전자",
+    "000660.KS": "SK하이닉스",
+    "012450.KS": "한화에어로스페이스",
+    "079550.KS": "LIG넥스원",
+    "373220.KS": "LG에너지솔루션",
+    "277810.KQ": "레인보우로보틱스",
+    "272210.KS": "한화시스템",
+    "082740.KS": "한화엔진",
+    "001260.KS": "남광토건",
+
+    "SKHY": "SK이노베이션",
+}
+
+
+def korean_ticker_name(ticker):
+    name = TICKER_KR_NAME.get(ticker)
+
+    if name:
+        return f"{name} ({ticker})"
+
+    return ticker
 def format_price(ticker: str, price: float) -> str:
     if pd.isna(price):
         return "-"
@@ -979,63 +1143,213 @@ st.caption(
 with st.sidebar:
     st.header("종목 선택")
 
-    preset = st.selectbox(
-        "빠른 목록",
-        ["보유종목", "기본 성장주", "보유종목 + 기본 성장주", "빈 목록"],
+    # =========================
+    # 현재 분석 종목
+    # =========================
+
+    st.subheader(
+        f"📌 현재 분석 목록 "
+        f"({len(st.session_state.selected_tickers)}개)"
     )
-
-    if st.button("이 목록 적용", use_container_width=True):
-        if preset == "보유종목":
-            st.session_state.selected_tickers = MY_HOLDINGS.copy()
-        elif preset == "기본 성장주":
-            st.session_state.selected_tickers = DEFAULT_TICKERS.copy()
-        elif preset == "보유종목 + 기본 성장주":
-            st.session_state.selected_tickers = list(
-                dict.fromkeys(MY_HOLDINGS + DEFAULT_TICKERS)
-            )
-        else:
-            st.session_state.selected_tickers = []
-
-    st.divider()
-    st.subheader("🔎 미국/나스닥 종목 검색")
-
-    search_query = st.text_input(
-        "회사명 또는 티커",
-        placeholder="예: NVIDIA, NVDA, Rocket Lab",
-    )
-
-    if st.button("검색", use_container_width=True):
-        st.session_state.search_results = search_us_stocks(search_query)
-
-    if st.session_state.search_results:
-        for item in st.session_state.search_results:
-            label = (
-                f"➕ {item['symbol']} | {item['name']} "
-                f"{'(NASDAQ)' if item['nasdaq'] else ''}"
-            )
-            if st.button(label, key=f"add_{item['symbol']}", use_container_width=True):
-                if item["symbol"] not in st.session_state.selected_tickers:
-                    st.session_state.selected_tickers.append(item["symbol"])
-
-    st.divider()
-    manual = st.text_input(
-        "직접 추가",
-        placeholder="PLTR 또는 삼성전자 또는 005930.KS",
-    )
-
-    if st.button("직접 추가", use_container_width=True):
-        ticker = normalize_ticker(manual)
-        if ticker and ticker not in st.session_state.selected_tickers:
-            st.session_state.selected_tickers.append(ticker)
 
     if st.session_state.selected_tickers:
-        st.caption("현재 분석 목록")
-        st.code(", ".join(st.session_state.selected_tickers), language=None)
 
-    if st.button("선택 목록 비우기", use_container_width=True):
+        remove_ticker = None
+
+        for i, ticker in enumerate(
+            list(st.session_state.selected_tickers)
+        ):
+
+            col1, col2 = st.columns([4, 1])
+
+            korean_name = ""
+
+            # 미국 한글 이름 찾기
+            for alias, (
+                symbol,
+                english_name,
+            ) in US_KR_ALIAS.items():
+
+                if symbol == ticker:
+                    korean_name = alias
+                    break
+
+            # 한국 종목 이름 찾기
+            if not korean_name:
+
+                for name, symbol in KR_NAME_MAP.items():
+
+                    if symbol == ticker:
+                        korean_name = name
+                        break
+
+            label = ticker
+
+            if korean_name:
+                label += f" · {korean_name}"
+
+            col1.write(label)
+
+            if col2.button(
+                "✕",
+                key=f"remove_{i}_{ticker}",
+            ):
+                remove_ticker = ticker
+
+        if remove_ticker:
+
+            st.session_state.selected_tickers = [
+                x
+                for x in st.session_state.selected_tickers
+                if x != remove_ticker
+            ]
+
+            st.rerun()
+
+    else:
+
+        st.caption(
+            "현재 선택된 종목이 없습니다."
+        )
+
+    col1, col2 = st.columns(2)
+
+    if col1.button(
+        "보유종목 불러오기",
+        use_container_width=True,
+    ):
+
+        st.session_state.selected_tickers = (
+            MY_HOLDINGS.copy()
+        )
+
+        st.rerun()
+
+    if col2.button(
+        "전체 비우기",
+        use_container_width=True,
+    ):
+
         st.session_state.selected_tickers = []
 
+        st.rerun()
+
     st.divider()
+
+    # =========================
+    # 종목 검색
+    # =========================
+
+    st.subheader("🔎 종목 검색")
+
+    st.caption(
+        "한글명 · 영문 회사명 · 티커 검색 가능"
+    )
+
+    search_query = st.text_input(
+        "검색어",
+        placeholder=(
+            "엔비디아, 로켓랩, "
+            "삼성전자, NVDA"
+        ),
+    )
+
+    if st.button(
+        "검색",
+        use_container_width=True,
+    ):
+
+        st.session_state.search_results = (
+            search_stocks(search_query)
+        )
+
+    if st.session_state.search_results:
+
+        st.caption("검색 결과")
+
+        for i, item in enumerate(
+            st.session_state.search_results
+        ):
+
+            col1, col2 = st.columns([4, 1])
+
+            exchange_text = ""
+
+            if item["nasdaq"]:
+
+                exchange_text = " · NASDAQ"
+
+            elif (
+                item["symbol"].endswith(".KS")
+                or item["symbol"].endswith(".KQ")
+            ):
+
+                exchange_text = " · 한국"
+
+            col1.write(
+                f"**{item['symbol']}**"
+                f"{exchange_text}"
+            )
+
+            col1.caption(
+                item["name"]
+            )
+
+            if col2.button(
+                "＋",
+                key=f"add_{i}_{item['symbol']}",
+            ):
+
+                if (
+                    item["symbol"]
+                    not in st.session_state.selected_tickers
+                ):
+
+                    st.session_state.selected_tickers.append(
+                        item["symbol"]
+                    )
+
+                st.rerun()
+
+    st.divider()
+
+    # =========================
+    # 직접 추가
+    # =========================
+
+    manual = st.text_input(
+        "직접 추가",
+        placeholder=(
+            "PLTR / 삼성전자 / "
+            "005930.KS"
+        ),
+    )
+
+    if st.button(
+        "직접 추가",
+        use_container_width=True,
+    ):
+
+        ticker = normalize_ticker(
+            manual
+        )
+
+        if (
+            ticker
+            and ticker
+            not in st.session_state.selected_tickers
+        ):
+
+            st.session_state.selected_tickers.append(
+                ticker
+            )
+
+            st.rerun()
+
+    st.divider()
+
+    # 여기 아래부터 기존 전략 설정 코드 계속
+
     st.header("전략 설정")
 
     start_date = st.date_input(
@@ -1178,6 +1492,7 @@ if run:
 
     # ---------- 메인 표 ----------
     display = screen.copy()
+    display["종목"] = display["종목"].map(korean_ticker_name)
 
     display["현재가"] = display.apply(
         lambda r: format_price(r["종목"], r["종가"]),
@@ -1212,39 +1527,94 @@ if run:
             lambda x: "" if pd.isna(x) else f"{x:.0%}"
         )
 
-    st.dataframe(
-        display[
-            [
-                "종목",
-                "종합 점수",
-                "의견",
-                "현재가 적정도",
-                "현재가 판단",
-                "현재가",
-                "1차 매수",
-                "2차 매수",
-                "3차 매수",
-                "현재가 비중",
-                "1차 비중",
-                "2차 비중",
-                "3차 비중",
-                "1개월 예상",
-                "3개월 예상",
-                "6개월 예상",
-                "1년 예상",
-                "3년 예상",
-                "5년 예상",
-                "뉴스 판단",
-                "판단 근거",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
+st.dataframe(
+    entry_view[
+        [
+            "종목",
+            "종합 점수",
+            "현재가 적정도",
+            "현재가 판단",
+            "현재가",
+            "1차",
+            "2차",
+            "3차",
+            "현재가 비중",
+            "1차 비중",
+            "2차 비중",
+            "3차 비중",
+            "현재가 판단 근거",
+        ]
+    ],
+    column_config={
+        "종목": st.column_config.TextColumn(
+            "종목",
+            width="large",
+        ),
+
+        "종합 점수": st.column_config.NumberColumn(
+            "종합 점수",
+            format="%.1f",
+            width="small",
+        ),
+
+        "현재가 적정도": st.column_config.NumberColumn(
+            "현재가 적정도",
+            format="%.1f",
+            width="small",
+        ),
+
+        "현재가 판단": st.column_config.TextColumn(
+            "현재가 판단",
+            width="medium",
+        ),
+
+        "현재가": st.column_config.TextColumn(
+            "현재가",
+            width="medium",
+        ),
+
+        "1차": st.column_config.TextColumn(
+            "1차 매수",
+            width="medium",
+        ),
+
+        "2차": st.column_config.TextColumn(
+            "2차 매수",
+            width="medium",
+        ),
+
+        "3차": st.column_config.TextColumn(
+            "3차 매수",
+            width="medium",
+        ),
+
+        "현재가 비중": st.column_config.NumberColumn(
+            "현재가 비중",
+            format="%.0%%",
+        ),
+
+        "1차 비중": st.column_config.NumberColumn(
+            "1차 비중",
+            format="%.0%%",
+        ),
+
+        "2차 비중": st.column_config.NumberColumn(
+            "2차 비중",
+            format="%.0%%",
+        ),
+
+        "3차 비중": st.column_config.NumberColumn(
+            "3차 비중",
+            format="%.0%%",
+        ),
+    },
+    use_container_width=True,
+    hide_index=True,
+)
 
     # ---------- 현재가 진입 판단 ----------
-    st.subheader("현재가 진입 판단")
-    entry_view = screen[
+st.subheader("현재가 진입 판단")
+entry_view = screen[
         [
             "종목",
             "종합 점수",
@@ -1262,24 +1632,24 @@ if run:
         ]
     ].copy()
 
-    entry_view["현재가"] = entry_view.apply(
+entry_view["현재가"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["종가"]),
         axis=1,
     )
-    entry_view["1차"] = entry_view.apply(
+entry_view["1차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["1차 매수가"]),
         axis=1,
     )
-    entry_view["2차"] = entry_view.apply(
+entry_view["2차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["2차 매수가"]),
         axis=1,
     )
-    entry_view["3차"] = entry_view.apply(
+entry_view["3차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["3차 매수가"]),
         axis=1,
     )
 
-    st.dataframe(
+st.dataframe(
         entry_view[
             [
                 "종목",
@@ -1308,16 +1678,16 @@ if run:
         hide_index=True,
     )
 
-    st.caption(
+st.caption(
         "분할비중은 해당 종목에 투자할 예정금액을 100%로 놓고 계산합니다."
     )
 
     # ---------- 미래 예상수익률 ----------
-    st.subheader("기간별 미래 예상수익률")
+st.subheader("기간별 미래 예상수익률")
 
-    forecast_rows = []
+forecast_rows = []
 
-    for _, row in screen.iterrows():
+for _, row in screen.iterrows():
         for label in FORECAST_HORIZONS:
             forecast_rows.append({
                 "종목": row["종목"],
@@ -1329,7 +1699,7 @@ if run:
 
     forecast_df = pd.DataFrame(forecast_rows)
 
-    st.dataframe(
+st.dataframe(
         forecast_df.style.format(
             {
                 "예상 수익률": "{:.1%}",
@@ -1341,15 +1711,15 @@ if run:
         hide_index=True,
     )
 
-    st.caption(
+st.caption(
         "예상수익률은 과거 월간 수익률 분포를 반복 복원추출한 통계적 시나리오의 중앙값입니다. "
         "특히 3년·5년은 불확실성이 매우 크므로 예상 범위와 상승확률을 함께 보세요."
     )
 
     # ---------- 추천 비중 ----------
-    st.subheader("현재 추천 비중")
+st.subheader("현재 추천 비중")
 
-    if recommended.empty:
+if recommended.empty:
         st.info("현재 65점 이상 종목이 없어 추천 비중을 산출하지 않습니다.")
     else:
         st.dataframe(
@@ -1443,7 +1813,7 @@ if run:
     )
 
 else:
-    st.markdown(
+st.markdown(
         """
         ### 이 앱에서 할 수 있는 것
 
