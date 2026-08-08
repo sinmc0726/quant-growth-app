@@ -19,6 +19,37 @@ import yfinance as yf
 # =========================
 st.set_page_config(page_title="한미 성장주 퀀트", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .block-container {
+        max-width: 1280px;
+        padding-top: 1.1rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        padding-bottom: 2rem;
+    }
+
+    div[data-testid="stMetric"] {
+        padding-top: 0.1rem;
+        padding-bottom: 0.1rem;
+    }
+
+    div[data-testid="stDataFrame"] {
+        margin-top: 0.2rem;
+        margin-bottom: 0.8rem;
+    }
+
+    h1, h2, h3 {
+        margin-top: 0.7rem;
+        margin-bottom: 0.4rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 DEFAULT_TICKERS = [
     "NVDA", "MSFT", "META", "AMZN", "GOOGL", "AVGO", "PLTR",
     "AMD", "TSLA", "CRWD", "ORCL", "RKLB", "JOBY", "UEC", "RCAT",
@@ -136,27 +167,56 @@ def parse_tickers(raw: str) -> List[str]:
     return list(dict.fromkeys([x for x in values if x]))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_nasdaq_universe() -> pd.DataFrame:
+    """NASDAQ Trader 공식 심볼 파일에서 현재 NASDAQ 상장 종목 목록을 가져옵니다."""
+    url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    try:
+        with urlopen(req, timeout=10) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+
+        df = pd.read_csv(BytesIO(raw.encode("utf-8")), sep="|")
+
+        # 마지막 File Creation Time 행 제거
+        df = df[df["Symbol"].notna()].copy()
+        df = df[~df["Symbol"].astype(str).str.startswith("File Creation Time")]
+
+        # 테스트 종목 제외
+        if "Test Issue" in df.columns:
+            df = df[df["Test Issue"].astype(str).str.upper() != "Y"]
+
+        df["Symbol"] = df["Symbol"].astype(str).str.upper().str.strip()
+        df["Security Name"] = df["Security Name"].astype(str).str.strip()
+
+        return df[["Symbol", "Security Name"]].drop_duplicates("Symbol")
+
+    except Exception:
+        return pd.DataFrame(columns=["Symbol", "Security Name"])
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_stocks(query: str) -> List[dict]:
+    """
+    1) 한글 별칭/한국 종목명 검색
+    2) NASDAQ Trader에서 자동으로 가져온 전체 NASDAQ 목록 검색
+    3) 필요 시 Yahoo Finance 검색으로 보완
+    """
     q = query.strip()
-
     if not q:
         return []
 
-    results = []
-    seen = set()
-
     q_clean = q.lower().replace(" ", "")
+    results: List[dict] = []
+    seen = set()
 
     # 한국 종목 한글 검색
     for name, symbol in KR_NAME_MAP.items():
         name_clean = name.lower().replace(" ", "")
-
         if q_clean in name_clean or name_clean in q_clean:
             if symbol not in seen:
                 seen.add(symbol)
-
                 results.append({
                     "symbol": symbol,
                     "name": name,
@@ -164,14 +224,12 @@ def search_stocks(query: str) -> List[dict]:
                     "nasdaq": False,
                 })
 
-    # 미국 종목 한글 검색
+    # 미국 종목 한글 별칭 검색
     for alias, (symbol, english_name) in US_KR_ALIAS.items():
         alias_clean = alias.lower().replace(" ", "")
-
         if q_clean in alias_clean or alias_clean in q_clean:
             if symbol not in seen:
                 seen.add(symbol)
-
                 results.append({
                     "symbol": symbol,
                     "name": f"{alias} · {english_name}",
@@ -179,89 +237,612 @@ def search_stocks(query: str) -> List[dict]:
                     "nasdaq": True,
                 })
 
-    # Yahoo Finance 검색
-    url = (
-        "https://query1.finance.yahoo.com/v1/finance/search"
-        f"?q={quote(q)}&quotesCount=30&newsCount=0"
+    # NASDAQ 전체 상장 목록에서 티커/영문 회사명 검색
+    nasdaq = load_nasdaq_universe()
+    if not nasdaq.empty:
+        symbol_match = nasdaq["Symbol"].str.contains(q.upper(), regex=False, na=False)
+        name_match = nasdaq["Security Name"].str.contains(q, case=False, regex=False, na=False)
+        matched = nasdaq[symbol_match | name_match].copy()
+
+        # 정확한 티커 일치 -> 티커 시작 -> 이름 포함 순으로 정렬
+        matched["_exact"] = (matched["Symbol"] == q.upper()).astype(int)
+        matched["_prefix"] = matched["Symbol"].str.startswith(q.upper()).astype(int)
+        matched = matched.sort_values(["_exact", "_prefix", "Symbol"], ascending=[False, False, True])
+
+        for _, item in matched.head(25).iterrows():
+            symbol = str(item["Symbol"]).upper()
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            results.append({
+                "symbol": symbol,
+                "name": str(item["Security Name"]),
+                "exchange": "NASDAQ",
+                "nasdaq": True,
+            })
+
+    # NASDAQ 목록에서 안 잡히는 미국/한국 종목을 Yahoo로 보완
+    if len(results) < 15:
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/search"
+            f"?q={quote(q)}&quotesCount=20&newsCount=0"
+        )
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+        try:
+            with urlopen(req, timeout=6) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            payload = {}
+
+        for item in payload.get("quotes", []):
+            symbol = str(item.get("symbol", "")).upper()
+            quote_type = str(item.get("quoteType", "")).upper()
+            exchange = str(item.get("exchange", "")).upper()
+            name = item.get("shortname") or item.get("longname") or symbol
+
+            if not symbol or quote_type not in {"EQUITY", "ETF"} or symbol in seen:
+                continue
+
+            is_nasdaq = exchange in {"NMS", "NCM", "NGM", "NASDAQ"}
+            is_us = exchange in {"NMS", "NCM", "NGM", "NASDAQ", "NYQ", "ASE", "PCX", "BTS"}
+            is_korea = symbol.endswith(".KS") or symbol.endswith(".KQ")
+
+            if not (is_us or is_korea):
+                continue
+
+            seen.add(symbol)
+            results.append({
+                "symbol": symbol,
+                "name": str(name),
+                "exchange": exchange,
+                "nasdaq": is_nasdaq,
+            })
+
+    return results[:30]
+
+
+
+
+# =========================
+# 2차 종합 분석: 기술 + 실적 + 가치 + 뉴스 + 시장기대 + 통계
+# =========================
+
+def _safe_float(value, default=np.nan):
+    try:
+        if value is None:
+            return default
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def _clip_score(value: float, max_score: float) -> float:
+    return float(np.clip(value, 0.0, max_score))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_company_snapshot(ticker: str) -> dict:
+    """yfinance에서 실적·밸류·애널리스트 핵심값을 한 번에 가져옵니다."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        info = {}
+
+    return {
+        "revenueGrowth": _safe_float(info.get("revenueGrowth")),
+        "earningsGrowth": _safe_float(
+            info.get("earningsGrowth", info.get("earningsQuarterlyGrowth"))
+        ),
+        "profitMargins": _safe_float(info.get("profitMargins")),
+        "operatingMargins": _safe_float(info.get("operatingMargins")),
+        "freeCashflow": _safe_float(info.get("freeCashflow")),
+        "totalCash": _safe_float(info.get("totalCash")),
+        "totalDebt": _safe_float(info.get("totalDebt")),
+        "trailingPE": _safe_float(info.get("trailingPE")),
+        "forwardPE": _safe_float(info.get("forwardPE")),
+        "priceToSalesTrailing12Months": _safe_float(
+            info.get("priceToSalesTrailing12Months")
+        ),
+        "pegRatio": _safe_float(info.get("pegRatio")),
+        "targetMeanPrice": _safe_float(info.get("targetMeanPrice")),
+        "currentPrice": _safe_float(
+            info.get("currentPrice", info.get("regularMarketPrice"))
+        ),
+        "recommendationMean": _safe_float(info.get("recommendationMean")),
+        "numberOfAnalystOpinions": _safe_float(info.get("numberOfAnalystOpinions")),
+    }
+
+
+def score_fundamentals(info: dict) -> Tuple[float, str]:
+    """기업 실적/재무 25점."""
+    rev = info.get("revenueGrowth", np.nan)
+    earn = info.get("earningsGrowth", np.nan)
+    pm = info.get("profitMargins", np.nan)
+    om = info.get("operatingMargins", np.nan)
+    cash = info.get("totalCash", np.nan)
+    debt = info.get("totalDebt", np.nan)
+    fcf = info.get("freeCashflow", np.nan)
+
+    score = 0.0
+    parts = 0.0
+    reasons = []
+
+    # 매출 성장 8점
+    if pd.notna(rev):
+        if rev >= 0.30: s = 8
+        elif rev >= 0.20: s = 7
+        elif rev >= 0.10: s = 6
+        elif rev >= 0.05: s = 4.5
+        elif rev >= 0: s = 3
+        else: s = 1
+        score += s
+        parts += 8
+        reasons.append(f"매출성장 {rev:.1%}")
+
+    # 이익 성장 7점
+    if pd.notna(earn):
+        if earn >= 0.40: s = 7
+        elif earn >= 0.25: s = 6
+        elif earn >= 0.10: s = 5
+        elif earn >= 0: s = 3.5
+        else: s = 1
+        score += s
+        parts += 7
+        reasons.append(f"이익성장 {earn:.1%}")
+
+    # 수익성 6점
+    if pd.notna(pm):
+        s = 4 if pm >= 0.20 else 3 if pm >= 0.10 else 2 if pm >= 0 else 0.5
+        score += s
+        parts += 4
+        reasons.append(f"순이익률 {pm:.1%}")
+    if pd.notna(om):
+        s = 2 if om >= 0.20 else 1.5 if om >= 0.10 else 1 if om >= 0 else 0.25
+        score += s
+        parts += 2
+
+    # 현금흐름/재무건전성 4점
+    if pd.notna(fcf):
+        score += 2 if fcf > 0 else 0.5
+        parts += 2
+        reasons.append("FCF 흑자" if fcf > 0 else "FCF 적자")
+
+    if pd.notna(cash) and pd.notna(debt):
+        if debt <= 0:
+            s = 2
+        else:
+            ratio = cash / debt
+            s = 2 if ratio >= 1 else 1.5 if ratio >= 0.5 else 0.75
+        score += s
+        parts += 2
+
+    # 누락 데이터는 중립 50%로 채움
+    if parts < 25:
+        score += (25 - parts) * 0.5
+
+    return round(_clip_score(score, 25), 1), " / ".join(reasons[:4]) or "재무데이터 제한"
+
+
+def score_valuation(info: dict) -> Tuple[float, str]:
+    """밸류에이션 15점. 성장주 특성상 완전 저PER만 우대하지 않습니다."""
+    pe = info.get("forwardPE", np.nan)
+    if pd.isna(pe):
+        pe = info.get("trailingPE", np.nan)
+    ps = info.get("priceToSalesTrailing12Months", np.nan)
+    peg = info.get("pegRatio", np.nan)
+
+    available = []
+    reasons = []
+
+    if pd.notna(pe) and pe > 0:
+        s = 5 if pe <= 20 else 4.2 if pe <= 30 else 3.2 if pe <= 45 else 2 if pe <= 70 else 0.8
+        available.append((s, 5))
+        reasons.append(f"PER {pe:.1f}")
+
+    if pd.notna(ps) and ps > 0:
+        s = 5 if ps <= 3 else 4 if ps <= 6 else 3 if ps <= 10 else 1.8 if ps <= 20 else 0.7
+        available.append((s, 5))
+        reasons.append(f"PS {ps:.1f}")
+
+    if pd.notna(peg) and peg > 0:
+        s = 5 if peg <= 1 else 4 if peg <= 1.5 else 3 if peg <= 2.5 else 1.5 if peg <= 4 else 0.5
+        available.append((s, 5))
+        reasons.append(f"PEG {peg:.2f}")
+
+    if not available:
+        return 7.5, "가치평가 데이터 제한"
+
+    score = sum(s for s, _ in available)
+    max_seen = sum(m for _, m in available)
+    # 없는 항목은 중립점수로 채움
+    score += (15 - max_seen) * 0.5
+    return round(_clip_score(score, 15), 1), " / ".join(reasons)
+
+
+def score_analyst(info: dict, fallback_price=np.nan) -> Tuple[float, str]:
+    """애널리스트/시장 기대 10점."""
+    target = info.get("targetMeanPrice", np.nan)
+    current = info.get("currentPrice", np.nan)
+    if pd.isna(current):
+        current = fallback_price
+    rec = info.get("recommendationMean", np.nan)
+    count = info.get("numberOfAnalystOpinions", np.nan)
+
+    score = 5.0  # 기본 중립
+    reasons = []
+
+    if pd.notna(target) and pd.notna(current) and current > 0:
+        upside = target / current - 1
+        target_score = 6 if upside >= 0.30 else 5 if upside >= 0.15 else 4 if upside >= 0.05 else 3 if upside >= -0.05 else 1.5
+        reasons.append(f"목표가 여력 {upside:.1%}")
+    else:
+        target_score = 3
+
+    if pd.notna(rec) and rec > 0:
+        # Yahoo recommendationMean: 1 강매수 ~ 5 매도
+        rec_score = 4 if rec <= 1.7 else 3.3 if rec <= 2.2 else 2.5 if rec <= 2.8 else 1.5 if rec <= 3.5 else 0.5
+        reasons.append(f"애널리스트 {rec:.2f}")
+    else:
+        rec_score = 2
+
+    score = target_score + rec_score
+
+    # 의견 수가 너무 적으면 과신 방지
+    if pd.notna(count) and count < 3:
+        score *= 0.85
+        reasons.append("의견수 적음")
+
+    return round(_clip_score(score, 10), 1), " / ".join(reasons) or "시장기대 데이터 제한"
+
+
+def score_news(news_item: dict) -> Tuple[float, str]:
+    """뉴스 15점: 기존 -10~+10 보정을 0~15점으로 매핑."""
+    adj = float(news_item.get("adjustment", 0.0) or 0.0)
+    score = 7.5 + adj * 0.75
+    label = news_item.get("label", "중립")
+    return round(_clip_score(score, 15), 1), f"{label} ({adj:+.1f})"
+
+
+def statistical_score_from_history(series: pd.Series) -> Tuple[float, str]:
+    """
+    현재와 비슷한 추세/RSI/모멘텀 구간 이후 63거래일 수익률을 찾아 10점 평가.
+    표본이 적으면 전체 3개월 분포로 대체합니다.
+    """
+    s = series.dropna().astype(float)
+    if len(s) < 190:
+        return 5.0, "통계 표본 부족"
+
+    ma20 = s.rolling(20).mean()
+    ma120 = s.rolling(120).mean()
+    mom63 = s.pct_change(63)
+    rsi = compute_rsi(s, 14)
+    fwd63 = s.shift(-63) / s - 1
+
+    cur_rsi = rsi.iloc[-1]
+    cur_mom = mom63.iloc[-1]
+    cur_trend1 = s.iloc[-1] > ma120.iloc[-1]
+    cur_trend2 = ma20.iloc[-1] > ma120.iloc[-1]
+
+    mask = (
+        (rsi.sub(cur_rsi).abs() <= 8)
+        & (mom63.sub(cur_mom).abs() <= 0.12)
+        & ((s > ma120) == cur_trend1)
+        & ((ma20 > ma120) == cur_trend2)
     )
 
-    req = Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
+    samples = fwd63[mask].dropna()
+    if len(samples) < 12:
+        samples = fwd63.dropna()
+
+    if len(samples) < 12:
+        return 5.0, "통계 표본 부족"
+
+    up_prob = float((samples > 0).mean())
+    median = float(samples.median())
+
+    prob_score = np.interp(up_prob, [0.35, 0.50, 0.65, 0.80], [0.5, 2.5, 5.5, 7.0])
+    return_score = np.interp(median, [-0.10, 0.00, 0.10, 0.25], [0.0, 1.0, 2.0, 3.0])
+    score = float(np.clip(prob_score + return_score, 0, 10))
+
+    return round(score, 1), f"유사구간 {len(samples)}회 · 3개월 상승 {up_prob:.0%} · 중앙값 {median:.1%}"
+
+
+def add_multifactor_scores(
+    screen: pd.DataFrame,
+    prices: pd.DataFrame,
+    news_data: Dict[str, dict] | None = None,
+) -> pd.DataFrame:
+    """
+    기존 기술점수를 25점으로 축소하고,
+    실적25 + 가치15 + 뉴스15 + 시장기대10 + 통계10 = 총 100점으로 재평가합니다.
+    """
+    out = screen.copy()
+    news_data = news_data or {}
+
+    for idx, row in out.iterrows():
+        ticker = row["종목"]
+        technical_25 = round(float(row.get("기술 점수", 0.0)) * 0.25, 1)
+
+        info = fetch_company_snapshot(ticker)
+        fundamental, fundamental_reason = score_fundamentals(info)
+        valuation, valuation_reason = score_valuation(info)
+        news_score, news_reason = score_news(news_data.get(ticker, {}))
+        analyst, analyst_reason = score_analyst(info, row.get("종가", np.nan))
+
+        if ticker in prices.columns:
+            stat_score, stat_reason = statistical_score_from_history(prices[ticker])
+        else:
+            stat_score, stat_reason = 5.0, "가격 이력 부족"
+
+        total = (
+            technical_25
+            + fundamental
+            + valuation
+            + news_score
+            + analyst
+            + stat_score
+        )
+
+        out.at[idx, "기술/차트 점수"] = technical_25
+        out.at[idx, "기업실적 점수"] = fundamental
+        out.at[idx, "밸류에이션 점수"] = valuation
+        out.at[idx, "뉴스/이벤트 점수"] = news_score
+        out.at[idx, "시장기대 점수"] = analyst
+        out.at[idx, "통계/확률 점수"] = stat_score
+        out.at[idx, "종합 점수"] = round(float(np.clip(total, 0, 100)), 1)
+        out.at[idx, "의견"] = opinion_from_score(out.at[idx, "종합 점수"])
+        out.at[idx, "종합 판단 근거"] = (
+            f"기술 {technical_25:.1f}/25 · 실적 {fundamental:.1f}/25 · "
+            f"가치 {valuation:.1f}/15 · 뉴스 {news_score:.1f}/15 · "
+            f"시장기대 {analyst:.1f}/10 · 통계 {stat_score:.1f}/10"
+        )
+        out.at[idx, "실적 근거"] = fundamental_reason
+        out.at[idx, "가치 근거"] = valuation_reason
+        out.at[idx, "뉴스 근거"] = news_reason
+        out.at[idx, "시장기대 근거"] = analyst_reason
+        out.at[idx, "통계 근거"] = stat_reason
+
+    return out.sort_values("종합 점수", ascending=False).reset_index(drop=True)
+
+
+# =========================
+# NASDAQ 추천 후보 자동 탐색
+# =========================
+
+NASDAQ100_FALLBACK = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AXON", "AZN", "BIIB", "BKNG",
+    "BKR", "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD",
+    "CSCO", "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DXCM", "EA", "EXC",
+    "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
+    "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "MAR", "MCHP",
+    "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MSTR", "MU", "NFLX",
+    "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD", "PEP",
+    "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SNPS", "TEAM", "TMUS",
+    "TSLA", "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS",
+]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_nasdaq100_universe() -> List[str]:
+    """
+    Nasdaq-100 구성 종목을 웹에서 가져오고, 실패하면 내장 목록으로 대체합니다.
+    """
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        for table in tables:
+            cols = [str(c).strip().lower() for c in table.columns]
+            if "ticker" in cols:
+                ticker_col = table.columns[cols.index("ticker")]
+                tickers = (
+                    table[ticker_col]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .str.replace(".", "-", regex=False)
+                    .tolist()
+                )
+                tickers = [x for x in tickers if x and x != "NAN"]
+                if len(tickers) >= 80:
+                    return list(dict.fromkeys(tickers))
+    except Exception:
+        pass
+
+    return NASDAQ100_FALLBACK.copy()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_nasdaq_candidates(limit: int = 15) -> pd.DataFrame:
+    """
+    1차: Nasdaq-100 전체를 기술점수로 빠르게 스캔
+    2차: 상위 후보만 실적·밸류·뉴스·애널리스트·통계까지 심층 분석
+    """
+    tickers = load_nasdaq100_universe()
+    if not tickers:
+        return pd.DataFrame()
 
     try:
-        with urlopen(req, timeout=6) as response:
-            payload = json.loads(
-                response.read().decode("utf-8")
-            )
+        data = yf.download(
+            tickers,
+            period="3y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="column",
+            threads=True,
+        )
     except Exception:
-        payload = {}
+        return pd.DataFrame()
 
-    for item in payload.get("quotes", []):
-        symbol = str(
-            item.get("symbol", "")
-        ).upper()
+    if data.empty:
+        return pd.DataFrame()
 
-        quote_type = str(
-            item.get("quoteType", "")
-        ).upper()
+    def get_field(field: str) -> pd.DataFrame:
+        if isinstance(data.columns, pd.MultiIndex):
+            if field not in data.columns.get_level_values(0):
+                return pd.DataFrame()
+            out = data[field].copy()
+        else:
+            if field not in data.columns:
+                return pd.DataFrame()
+            out = data[[field]].copy()
+            out.columns = [tickers[0]]
+        if isinstance(out, pd.Series):
+            out = out.to_frame()
+        return out
 
-        exchange = str(
-            item.get("exchange", "")
-        ).upper()
+    close = get_field("Close")
+    volume = get_field("Volume")
 
-        name = (
-            item.get("shortname")
-            or item.get("longname")
-            or symbol
-        )
+    if close.empty:
+        return pd.DataFrame()
 
-        if not symbol:
+    close = close.dropna(how="all")
+    volume = volume.reindex(index=close.index, columns=close.columns)
+
+    rows = []
+    for ticker in close.columns:
+        s = close[ticker].dropna()
+        if len(s) < 130:
             continue
 
-        if quote_type not in {"EQUITY", "ETF"}:
-            continue
+        price = float(s.iloc[-1])
+        ma20 = float(s.rolling(20).mean().iloc[-1])
+        ma120 = float(s.rolling(120).mean().iloc[-1])
+        mom63 = float(s.pct_change(63).iloc[-1])
+        vol63 = float(s.pct_change().rolling(63).std().iloc[-1] * np.sqrt(252))
+        high52 = float(s.rolling(252, min_periods=120).max().iloc[-1])
+        high_near = price / high52 if high52 > 0 else np.nan
+        rsi = float(compute_rsi(s, 14).iloc[-1])
 
-        is_nasdaq = exchange in {
-            "NMS",
-            "NCM",
-            "NGM",
-            "NASDAQ",
-        }
+        vol_ratio = np.nan
+        if ticker in volume.columns:
+            v = volume[ticker].dropna()
+            if len(v) >= 20:
+                avg20 = float(v.rolling(20).mean().iloc[-1])
+                if avg20 > 0:
+                    vol_ratio = float(v.iloc[-1] / avg20)
 
-        is_us = exchange in {
-            "NMS",
-            "NCM",
-            "NGM",
-            "NASDAQ",
-            "NYQ",
-            "ASE",
-            "PCX",
-            "BTS",
-        }
-
-        is_korea = (
-            symbol.endswith(".KS")
-            or symbol.endswith(".KQ")
-        )
-
-        if not (is_us or is_korea):
-            continue
-
-        if symbol in seen:
-            continue
-
-        seen.add(symbol)
-
-        results.append({
-            "symbol": symbol,
-            "name": str(name),
-            "exchange": exchange,
-            "nasdaq": is_nasdaq,
+        rows.append({
+            "종목": ticker,
+            "종가": price,
+            "20일선": ma20,
+            "120일선": ma120,
+            "63일 모멘텀": mom63,
+            "RSI": rsi,
+            "연환산 변동성": vol63,
+            "거래량 배수": vol_ratio,
+            "52주 고점 근접도": high_near,
         })
 
-    return results[:15]
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw
+
+    raw = raw.set_index("종목")
+    mom_pct = percentile_score(raw["63일 모멘텀"], True)
+    volatility_pct = percentile_score(raw["연환산 변동성"], False)
+    volume_pct = percentile_score(raw["거래량 배수"], True)
+    high_pct = percentile_score(raw["52주 고점 근접도"], True)
+
+    technical_rows = []
+
+    for ticker, row in raw.iterrows():
+        trend_score = 0.0
+        if row["종가"] > row["120일선"]:
+            trend_score += 15.0
+        if row["20일선"] > row["120일선"]:
+            trend_score += 15.0
+
+        momentum_score = float(mom_pct.loc[ticker] * 25.0)
+
+        rsi = row["RSI"]
+        if 55 <= rsi <= 65:
+            rsi_score = 15.0
+        elif 45 <= rsi < 55 or 65 < rsi <= 72:
+            rsi_score = 12.0
+        elif 35 <= rsi < 45 or 72 < rsi <= 78:
+            rsi_score = 7.0
+        else:
+            rsi_score = 2.0
+
+        volatility_score = float(volatility_pct.loc[ticker] * 10.0)
+        volume_score = float(volume_pct.loc[ticker] * 10.0)
+        high_score = float(high_pct.loc[ticker] * 10.0)
+
+        tech100 = (
+            trend_score
+            + momentum_score
+            + rsi_score
+            + volatility_score
+            + volume_score
+            + high_score
+        )
+
+        technical_rows.append({
+            "종목": ticker,
+            "기술원점수": round(tech100, 1),
+            "현재가": row["종가"],
+            "RSI": round(rsi, 1),
+        })
+
+    # 1차 필터: 기술 상위 20개만 심층분석
+    pre = (
+        pd.DataFrame(technical_rows)
+        .sort_values("기술원점수", ascending=False)
+        .head(max(20, limit))
+        .reset_index(drop=True)
+    )
+
+    news_map = fetch_news_sentiment(tuple(pre["종목"].tolist()))
+    final_rows = []
+
+    for _, row in pre.iterrows():
+        ticker = row["종목"]
+        tech25 = round(float(row["기술원점수"]) * 0.25, 1)
+
+        info = fetch_company_snapshot(ticker)
+        fundamental, fundamental_reason = score_fundamentals(info)
+        valuation, valuation_reason = score_valuation(info)
+        news_score, news_reason = score_news(news_map.get(ticker, {}))
+        analyst, analyst_reason = score_analyst(info, row["현재가"])
+        stat_score, stat_reason = statistical_score_from_history(close[ticker])
+
+        total = tech25 + fundamental + valuation + news_score + analyst + stat_score
+
+        final_rows.append({
+            "종목": ticker,
+            "점수": round(float(np.clip(total, 0, 100)), 1),
+            "의견": opinion_from_score(total),
+            "기술": tech25,
+            "실적": fundamental,
+            "가치": valuation,
+            "뉴스": news_score,
+            "시장기대": analyst,
+            "통계": stat_score,
+            "현재가": row["현재가"],
+            "RSI": row["RSI"],
+            "판단 근거": (
+                f"기술 {tech25:.1f}/25 · 실적 {fundamental:.1f}/25 · "
+                f"가치 {valuation:.1f}/15 · 뉴스 {news_score:.1f}/15 · "
+                f"시장 {analyst:.1f}/10 · 통계 {stat_score:.1f}/10"
+            ),
+            "세부 근거": (
+                f"{fundamental_reason} | {valuation_reason} | "
+                f"{news_reason} | {analyst_reason} | {stat_reason}"
+            ),
+        })
+
+    return (
+        pd.DataFrame(final_rows)
+        .sort_values("점수", ascending=False)
+        .head(int(limit))
+        .reset_index(drop=True)
+    )
 
 # =========================
 # 데이터 다운로드
@@ -1079,7 +1660,7 @@ TICKER_KR_NAME = {
     "082740.KS": "한화엔진",
     "001260.KS": "남광토건",
 
-    "SKHY": "SK이노베이션",
+    "SKHY": "SK하이닉스 ADR",
 }
 
 
@@ -1131,6 +1712,14 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = []
 
 
+if "favorites" not in st.session_state:
+    st.session_state.favorites = []
+
+
+if "nasdaq_recommendations" not in st.session_state:
+    st.session_state.nasdaq_recommendations = pd.DataFrame()
+
+
 # =========================
 # UI
 # =========================
@@ -1142,6 +1731,46 @@ st.caption(
 
 with st.sidebar:
     st.header("종목 선택")
+
+    # =========================
+    # 즐겨찾기
+    # =========================
+    st.subheader(f"⭐ 즐겨찾기 ({len(st.session_state.favorites)}개)")
+
+    if st.session_state.favorites:
+        favorite_to_remove = None
+
+        for i, ticker in enumerate(list(st.session_state.favorites)):
+            c1, c2, c3 = st.columns([5, 1, 1])
+
+            c1.write(korean_ticker_name(ticker))
+
+            if c2.button(
+                "＋",
+                key=f"favorite_add_{i}_{ticker}",
+                help="현재 분석 목록에 추가",
+            ):
+                if ticker not in st.session_state.selected_tickers:
+                    st.session_state.selected_tickers.append(ticker)
+                st.rerun()
+
+            if c3.button(
+                "✕",
+                key=f"favorite_remove_{i}_{ticker}",
+                help="즐겨찾기에서 삭제",
+            ):
+                favorite_to_remove = ticker
+
+        if favorite_to_remove:
+            st.session_state.favorites = [
+                x for x in st.session_state.favorites
+                if x != favorite_to_remove
+            ]
+            st.rerun()
+    else:
+        st.caption("검색 결과의 ⭐ 버튼으로 종목을 저장할 수 있습니다.")
+
+    st.divider()
 
     # =========================
     # 현재 분석 종목
@@ -1237,19 +1866,83 @@ with st.sidebar:
     st.divider()
 
     # =========================
+    # NASDAQ 추천 후보 자동 탐색
+    # =========================
+    st.subheader("🚀 NASDAQ 추천 후보")
+
+    st.caption(
+        "1차 기술 필터 후 실적·가치·뉴스·애널리스트·통계까지 2차 분석합니다."
+    )
+
+    if st.button(
+        "NASDAQ 추천 후보 찾기",
+        use_container_width=True,
+        key="scan_nasdaq_recommendations",
+    ):
+        with st.spinner("NASDAQ 종목을 스캔하는 중입니다..."):
+            st.session_state.nasdaq_recommendations = scan_nasdaq_candidates(15)
+
+    if not st.session_state.nasdaq_recommendations.empty:
+        for i, row in st.session_state.nasdaq_recommendations.head(10).iterrows():
+            ticker = str(row["종목"])
+            c1, c2, c3 = st.columns([5, 1, 1])
+
+            c1.write(
+                f"**{korean_ticker_name(ticker)}** · {float(row['점수']):.1f}점"
+            )
+            c1.caption(
+                f"{row['의견']} · 기술 {float(row['기술']):.1f}/25 · 실적 {float(row['실적']):.1f}/25"
+            )
+
+            if c2.button(
+                "＋",
+                key=f"nasdaq_rec_add_{i}_{ticker}",
+                help="현재 분석 목록에 추가",
+            ):
+                if ticker not in st.session_state.selected_tickers:
+                    st.session_state.selected_tickers.append(ticker)
+                st.rerun()
+
+            if c3.button(
+                "⭐",
+                key=f"nasdaq_rec_fav_{i}_{ticker}",
+                help="즐겨찾기에 추가",
+            ):
+                if ticker not in st.session_state.favorites:
+                    st.session_state.favorites.append(ticker)
+                st.rerun()
+
+
+        with st.expander("추천 점수 근거 보기"):
+            reason_view = st.session_state.nasdaq_recommendations[
+                ["종목", "점수", "기술", "실적", "가치", "뉴스", "시장기대", "통계", "판단 근거"]
+            ].copy()
+            reason_view["종목"] = reason_view["종목"].map(korean_ticker_name)
+            st.dataframe(reason_view, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # =========================
     # 종목 검색
     # =========================
 
     st.subheader("🔎 종목 검색")
 
-    st.caption(
-        "한글명 · 영문 회사명 · 티커 검색 가능"
-    )
+    nasdaq_universe = load_nasdaq_universe()
+    if not nasdaq_universe.empty:
+        st.caption(
+            f"NASDAQ 상장 종목 {len(nasdaq_universe):,}개 자동 연결 · "
+            "한글명/영문 회사명/티커 검색 가능"
+        )
+    else:
+        st.caption(
+            "NASDAQ 목록 연결 실패 · 한글 별칭/영문 회사명/티커 검색 가능"
+        )
 
     search_query = st.text_input(
         "검색어",
         placeholder=(
-            "엔비디아, 로켓랩, "
+            "엔비디아, NVIDIA, "
             "삼성전자, NVDA"
         ),
     )
@@ -1271,7 +1964,7 @@ with st.sidebar:
             st.session_state.search_results
         ):
 
-            col1, col2 = st.columns([4, 1])
+            col1, col2, col3 = st.columns([4, 1, 1])
 
             exchange_text = ""
 
@@ -1309,6 +2002,16 @@ with st.sidebar:
                         item["symbol"]
                     )
 
+                st.rerun()
+
+
+            if col3.button(
+                "⭐",
+                key=f"favorite_{i}_{item['symbol']}",
+                help="즐겨찾기에 추가",
+            ):
+                if item["symbol"] not in st.session_state.favorites:
+                    st.session_state.favorites.append(item["symbol"])
                 st.rerun()
 
     st.divider()
@@ -1464,14 +2167,21 @@ if run:
             quotes = fetch_latest_quotes(tuple(screen["종목"].tolist()))
         screen = apply_live_quotes(screen, quotes)
 
+    news_data = {}
     if use_news:
         with st.spinner("최근 뉴스 제목 확인 중입니다."):
             news_data = fetch_news_sentiment(tuple(screen["종목"].tolist()))
+        # 뉴스 제목/라벨은 유지하되 최종 종합점수는 아래 6요소 모델에서 다시 계산합니다.
         screen = apply_news_adjustment(screen, news_data)
+
+    # 통계 점수에 미래 분포를 활용할 수 있도록 예상수익률을 먼저 계산
+    screen = add_forecasts(screen, prices)
+
+    with st.spinner("실적·밸류·뉴스·시장기대·통계까지 종합 분석 중입니다."):
+        screen = add_multifactor_scores(screen, prices, news_data)
 
     screen = add_buy_points(screen, cfg)
     screen = add_current_entry_judgement(screen, cfg)
-    screen = add_forecasts(screen, prices)
 
     recommended = current_recommended_weights(screen, cfg.max_positions)
 
@@ -1482,7 +2192,7 @@ if run:
 
     if not screen.empty:
         top = screen.iloc[0]
-        summary_cols[0].metric("1위 종목", str(top["종목"]))
+        summary_cols[0].metric("1위 종목", korean_ticker_name(str(top["종목"])))
         summary_cols[1].metric("최고 점수", f'{top["종합 점수"]:.1f}점')
         summary_cols[2].metric("현재가 판단", str(top["현재가 판단"]))
         summary_cols[3].metric(
@@ -1492,8 +2202,8 @@ if run:
 
     # ---------- 메인 표 ----------
     display = screen.copy()
-    display["종목"] = display["종목"].map(korean_ticker_name)
 
+    # 가격 문자열은 원래 티커를 사용해 먼저 생성해야 한국 종목이 원화로 표시됨
     display["현재가"] = display.apply(
         lambda r: format_price(r["종목"], r["종가"]),
         axis=1,
@@ -1517,6 +2227,9 @@ if run:
         axis=1,
     )
 
+    # 화면에 보이는 종목명만 한글명 + 티커로 변경
+    display["종목"] = display["종목"].map(korean_ticker_name)
+
     for label in FORECAST_HORIZONS:
         display[f"{label} 예상"] = display[f"{label} 예상"].map(
             lambda x: "" if pd.isna(x) else f"{x:.1%}"
@@ -1527,94 +2240,78 @@ if run:
             lambda x: "" if pd.isna(x) else f"{x:.0%}"
         )
 
-st.dataframe(
-    entry_view[
-        [
-            "종목",
-            "종합 점수",
-            "현재가 적정도",
-            "현재가 판단",
-            "현재가",
-            "1차",
-            "2차",
-            "3차",
-            "현재가 비중",
-            "1차 비중",
-            "2차 비중",
-            "3차 비중",
-            "현재가 판단 근거",
-        ]
-    ],
-    column_config={
-        "종목": st.column_config.TextColumn(
-            "종목",
-            width="large",
-        ),
+    st.dataframe(
+        display[
+            [
+                "종목",
+                "종합 점수",
+                "기술/차트 점수",
+                "기업실적 점수",
+                "밸류에이션 점수",
+                "뉴스/이벤트 점수",
+                "시장기대 점수",
+                "통계/확률 점수",
+                "의견",
+                "현재가 적정도",
+                "현재가 판단",
+                "현재가",
+                "1차 매수",
+                "2차 매수",
+                "3차 매수",
+                "현재가 비중",
+                "1차 비중",
+                "2차 비중",
+                "3차 비중",
+                "1개월 예상",
+                "3개월 예상",
+                "6개월 예상",
+                "1년 예상",
+                "3년 예상",
+                "5년 예상",
+                "뉴스 판단",
+                "판단 근거",
+            ]
+        ],
+        column_config={
+            "종목": st.column_config.TextColumn("종목", width="large"),
+            "종합 점수": st.column_config.NumberColumn(
+                "종합 점수", format="%.1f", width="small"
+            ),
+            "현재가 적정도": st.column_config.NumberColumn(
+                "현재가 적정도", format="%.1f", width="small"
+            ),
+            "현재가 판단": st.column_config.TextColumn(
+                "현재가 판단", width="medium"
+            ),
+            "현재가": st.column_config.TextColumn("현재가", width="medium"),
+            "1차 매수": st.column_config.TextColumn("1차 매수", width="medium"),
+            "2차 매수": st.column_config.TextColumn("2차 매수", width="medium"),
+            "3차 매수": st.column_config.TextColumn("3차 매수", width="medium"),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        "종합 점수": st.column_config.NumberColumn(
-            "종합 점수",
-            format="%.1f",
-            width="small",
-        ),
-
-        "현재가 적정도": st.column_config.NumberColumn(
-            "현재가 적정도",
-            format="%.1f",
-            width="small",
-        ),
-
-        "현재가 판단": st.column_config.TextColumn(
-            "현재가 판단",
-            width="medium",
-        ),
-
-        "현재가": st.column_config.TextColumn(
-            "현재가",
-            width="medium",
-        ),
-
-        "1차": st.column_config.TextColumn(
-            "1차 매수",
-            width="medium",
-        ),
-
-        "2차": st.column_config.TextColumn(
-            "2차 매수",
-            width="medium",
-        ),
-
-        "3차": st.column_config.TextColumn(
-            "3차 매수",
-            width="medium",
-        ),
-
-        "현재가 비중": st.column_config.NumberColumn(
-            "현재가 비중",
-            format="%.0%%",
-        ),
-
-        "1차 비중": st.column_config.NumberColumn(
-            "1차 비중",
-            format="%.0%%",
-        ),
-
-        "2차 비중": st.column_config.NumberColumn(
-            "2차 비중",
-            format="%.0%%",
-        ),
-
-        "3차 비중": st.column_config.NumberColumn(
-            "3차 비중",
-            format="%.0%%",
-        ),
-    },
-    use_container_width=True,
-    hide_index=True,
-)
+    with st.expander("왜 이 점수인지 쉽게 보기"):
+        explain_view = screen[
+            [
+                "종목",
+                "종합 점수",
+                "종합 판단 근거",
+                "실적 근거",
+                "가치 근거",
+                "뉴스 근거",
+                "시장기대 근거",
+                "통계 근거",
+            ]
+        ].copy()
+        explain_view["종목"] = explain_view["종목"].map(korean_ticker_name)
+        st.dataframe(explain_view, use_container_width=True, hide_index=True)
 
     # ---------- 현재가 진입 판단 ----------
-st.subheader("현재가 진입 판단")
-entry_view = screen[
+    st.subheader("현재가 진입 판단")
+
+    entry_view = screen[
         [
             "종목",
             "종합 점수",
@@ -1632,24 +2329,26 @@ entry_view = screen[
         ]
     ].copy()
 
-entry_view["현재가"] = entry_view.apply(
+    # 가격 표시 후 종목명을 한글로 변경
+    entry_view["현재가"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["종가"]),
         axis=1,
     )
-entry_view["1차"] = entry_view.apply(
+    entry_view["1차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["1차 매수가"]),
         axis=1,
     )
-entry_view["2차"] = entry_view.apply(
+    entry_view["2차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["2차 매수가"]),
         axis=1,
     )
-entry_view["3차"] = entry_view.apply(
+    entry_view["3차"] = entry_view.apply(
         lambda r: format_price(r["종목"], r["3차 매수가"]),
         axis=1,
     )
+    entry_view["종목"] = entry_view["종목"].map(korean_ticker_name)
 
-st.dataframe(
+    st.dataframe(
         entry_view[
             [
                 "종목",
@@ -1666,28 +2365,49 @@ st.dataframe(
                 "3차 비중",
                 "현재가 판단 근거",
             ]
-        ].style.format(
-            {
-                "현재가 비중": "{:.0%}",
-                "1차 비중": "{:.0%}",
-                "2차 비중": "{:.0%}",
-                "3차 비중": "{:.0%}",
-            }
-        ),
+        ],
+        column_config={
+            "종목": st.column_config.TextColumn("종목", width="large"),
+            "종합 점수": st.column_config.NumberColumn(
+                "종합 점수", format="%.1f", width="small"
+            ),
+            "현재가 적정도": st.column_config.NumberColumn(
+                "현재가 적정도", format="%.1f", width="small"
+            ),
+            "현재가 판단": st.column_config.TextColumn(
+                "현재가 판단", width="medium"
+            ),
+            "현재가": st.column_config.TextColumn("현재가", width="medium"),
+            "1차": st.column_config.TextColumn("1차 매수", width="medium"),
+            "2차": st.column_config.TextColumn("2차 매수", width="medium"),
+            "3차": st.column_config.TextColumn("3차 매수", width="medium"),
+            "현재가 비중": st.column_config.NumberColumn(
+                "현재가 비중", format="%.0f%%"
+            ),
+            "1차 비중": st.column_config.NumberColumn(
+                "1차 비중", format="%.0f%%"
+            ),
+            "2차 비중": st.column_config.NumberColumn(
+                "2차 비중", format="%.0f%%"
+            ),
+            "3차 비중": st.column_config.NumberColumn(
+                "3차 비중", format="%.0f%%"
+            ),
+        },
         use_container_width=True,
         hide_index=True,
     )
 
-st.caption(
+    st.caption(
         "분할비중은 해당 종목에 투자할 예정금액을 100%로 놓고 계산합니다."
     )
 
     # ---------- 미래 예상수익률 ----------
-st.subheader("기간별 미래 예상수익률")
+    st.subheader("기간별 미래 예상수익률")
 
-forecast_rows = []
+    forecast_rows = []
 
-for _, row in screen.iterrows():
+    for _, row in screen.iterrows():
         for label in FORECAST_HORIZONS:
             forecast_rows.append({
                 "종목": row["종목"],
@@ -1699,7 +2419,10 @@ for _, row in screen.iterrows():
 
     forecast_df = pd.DataFrame(forecast_rows)
 
-st.dataframe(
+    if not forecast_df.empty:
+        forecast_df["종목"] = forecast_df["종목"].map(korean_ticker_name)
+
+    st.dataframe(
         forecast_df.style.format(
             {
                 "예상 수익률": "{:.1%}",
@@ -1711,19 +2434,22 @@ st.dataframe(
         hide_index=True,
     )
 
-st.caption(
+    st.caption(
         "예상수익률은 과거 월간 수익률 분포를 반복 복원추출한 통계적 시나리오의 중앙값입니다. "
         "특히 3년·5년은 불확실성이 매우 크므로 예상 범위와 상승확률을 함께 보세요."
     )
 
     # ---------- 추천 비중 ----------
-st.subheader("현재 추천 비중")
+    st.subheader("현재 추천 비중")
 
-if recommended.empty:
+    if recommended.empty:
         st.info("현재 65점 이상 종목이 없어 추천 비중을 산출하지 않습니다.")
     else:
+        recommended_display = recommended.copy()
+        recommended_display["종목"] = recommended_display["종목"].map(korean_ticker_name)
+
         st.dataframe(
-            recommended.style.format({"추천 비중": "{:.2%}"}),
+            recommended_display.style.format({"추천 비중": "{:.2%}"}),
             use_container_width=True,
             hide_index=True,
         )
@@ -1731,6 +2457,7 @@ if recommended.empty:
     # ---------- 세부 분석 ----------
     with st.expander("점수 구성 / 뉴스 / 세부 지표 보기"):
         detail = screen.copy()
+        detail["종목"] = detail["종목"].map(korean_ticker_name)
 
         for col in [
             f"{cfg.momentum_days}일 모멘텀",
@@ -1813,7 +2540,7 @@ if recommended.empty:
     )
 
 else:
-st.markdown(
+    st.markdown(
         """
         ### 이 앱에서 할 수 있는 것
 
@@ -1827,12 +2554,14 @@ st.markdown(
         8. 각 기간 10~90% 예상범위와 과거 분포 기반 상승확률
         9. 필요할 때만 과거 백테스트 확인
 
-        ### 기술 점수 구성
-        - 추세 30점
-        - 모멘텀 25점
-        - RSI 15점
-        - 변동성 10점
-        - 거래량 10점
-        - 52주 고점 근접도 10점
+        ### 최종 종합 점수 구성
+        - 기술/차트 25점
+        - 기업 실적·재무 25점
+        - 밸류에이션 15점
+        - 뉴스·이벤트 15점
+        - 애널리스트·시장 기대 10점
+        - 과거 유사구간 통계·확률 10점
+
+        **NASDAQ 추천은 1차로 차트가 강한 종목을 걸러낸 뒤, 위 6개 요소로 2차 심층 분석합니다.**
         """
     )
